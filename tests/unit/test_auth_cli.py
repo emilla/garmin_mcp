@@ -419,3 +419,44 @@ class TestAuthenticateIsCn:
             prompt_mfa=get_mfa,
             return_on_mfa=True,
         )
+
+
+class TestExportTokens:
+    """Tests for export_tokens function."""
+
+    @patch("garmin_mcp.auth_cli.token_exists", return_value=False)
+    def test_export_nonexistent_tokens(self, mock_exists, capsys):
+        """Export fails cleanly when no tokens are saved."""
+        from garmin_mcp.auth_cli import export_tokens
+
+        result = export_tokens("/test/path")
+        assert result is False
+        captured = capsys.readouterr()
+        assert "Tokens not found" in captured.err
+        assert captured.out == ""
+
+    @patch("garmin_mcp.auth_cli.Garmin")
+    @patch("garmin_mcp.auth_cli.token_exists", return_value=True)
+    def test_export_prints_token_data_to_stdout(self, mock_exists, mock_garmin, capsys):
+        """Export prints only the token string to stdout (pipeable)."""
+        from garmin_mcp.auth_cli import export_tokens
+
+        mock_garmin.return_value.client.dumps.return_value = "TOKENDATA123"
+
+        result = export_tokens("~/.garminconnect")
+        assert result is True
+        captured = capsys.readouterr()
+        assert captured.out.strip() == "TOKENDATA123"
+        assert "GARMINTOKENS" in captured.err
+
+    @patch("garmin_mcp.auth_cli.Garmin")
+    @patch("garmin_mcp.auth_cli.token_exists", return_value=True)
+    def test_export_handles_unreadable_tokens(self, mock_exists, mock_garmin, capsys):
+        """Export fails cleanly when the token directory cannot be loaded."""
+        from garmin_mcp.auth_cli import export_tokens
+
+        mock_garmin.return_value.client.load.side_effect = OSError("corrupt")
+
+        result = export_tokens("/test/path")
+        assert result is False
+        assert "Could not read tokens" in capsys.readouterr().err
