@@ -154,10 +154,19 @@ def init_api(email, password):
     """Initialize Garmin API with your credentials."""
     import io
 
+    # GARMINTOKENS may hold a directory path or, for headless deployments
+    # (e.g. Railway), the raw token data printed by `garmin-mcp-auth --export`.
+    # garminconnect treats values longer than 512 chars as token data. Never
+    # echo the value itself: token data grants full access to the account.
+    token_is_data = len(tokenstore) > 512
+    token_source = (
+        "GARMINTOKENS environment data" if token_is_data else f"directory '{tokenstore}'"
+    )
+
     try:
         # Using Oauth1 and OAuth2 token files from directory
         print(
-            f"Trying to login to Garmin Connect using token data from directory '{tokenstore}'...\n",
+            f"Trying to login to Garmin Connect using token data from {token_source}...\n",
             file=sys.stderr,
         )
 
@@ -179,8 +188,20 @@ def init_api(email, password):
         finally:
             sys.stderr = old_stderr
 
-    except (FileNotFoundError, GarminConnectConnectionError, GarminConnectTooManyRequestsError, GarminConnectAuthenticationError):
+    except (FileNotFoundError, ValueError, GarminConnectConnectionError, GarminConnectTooManyRequestsError, GarminConnectAuthenticationError):
         # Session is expired. You'll need to log in again
+
+        if token_is_data:
+            # Headless deployment with inline token data: re-authentication is
+            # not possible here, and the credential fallback below would try to
+            # dump tokens to the data string as if it were a path.
+            print(
+                "ERROR: GARMINTOKENS token data is invalid or expired.\n"
+                "Re-export fresh tokens with 'garmin-mcp-auth --export' and update\n"
+                "the GARMINTOKENS environment variable on your server.\n",
+                file=sys.stderr,
+            )
+            return None
 
         # Check if we're in a non-interactive environment without credentials
         if not is_interactive_terminal() and (not email or not password):
@@ -275,6 +296,47 @@ def init_api(email, password):
     return garmin
 
 
+# --- Transport selection -----------------------------------------------------
+# MCP_TRANSPORT selects how the server is exposed:
+#   stdio (default)   - spawned by a local MCP client such as Claude Desktop
+#   streamable-http   - remote deployments (Railway etc.); claude.ai connects here
+#   sse               - legacy HTTP transport
+VALID_TRANSPORTS = ("stdio", "sse", "streamable-http")
+
+
+def _transport_from_env(environ=None):
+    """Resolve the MCP transport from MCP_TRANSPORT, defaulting to stdio."""
+    environ = os.environ if environ is None else environ
+    transport = environ.get("MCP_TRANSPORT", "stdio").strip().lower().replace("_", "-")
+    if transport not in VALID_TRANSPORTS:
+        print(
+            f"Unknown MCP_TRANSPORT '{transport}'; expected one of: "
+            f"{', '.join(VALID_TRANSPORTS)}. Falling back to stdio.",
+            file=sys.stderr,
+        )
+        return "stdio"
+    return transport
+
+
+def _http_settings_from_env(environ=None):
+    """FastMCP host/port/path settings for the HTTP transports.
+
+    PORT (injected by PaaS hosts like Railway) takes precedence over
+    MCP_HTTP_PORT. MCP_HTTP_PATH may carry a secret suffix (e.g.
+    /mcp-<random>) so an otherwise unauthenticated endpoint is unguessable.
+    """
+    environ = os.environ if environ is None else environ
+    path = environ.get("MCP_HTTP_PATH", "/mcp")
+    if not path.startswith("/"):
+        path = "/" + path
+    return {
+        "host": environ.get("MCP_HTTP_HOST", "0.0.0.0"),
+        "port": int(environ.get("PORT") or environ.get("MCP_HTTP_PORT") or "8000"),
+        "streamable_http_path": path,
+    }
+# ------------------------------------------------------------------------------
+
+
 def main():
     """Initialize the MCP server and register all tools"""
 
@@ -303,8 +365,13 @@ def main():
     courses.configure(garmin_client)
     activity_analysis.configure(garmin_client)
 
+    transport = _transport_from_env()
+    http_settings = _http_settings_from_env() if transport != "stdio" else {}
+
     # Create the MCP app, wrapped so the env-var filter can drop tools
-    app = _ToolFilter(FastMCP("Garmin Connect v1.0"), enabled_tools, disabled_tools)
+    app = _ToolFilter(
+        FastMCP("Garmin Connect v1.0", **http_settings), enabled_tools, disabled_tools
+    )
     if enabled_tools:
         print(f"Tool filter: allowlist of {len(enabled_tools)} tool(s).", file=sys.stderr)
     elif disabled_tools:
@@ -339,7 +406,14 @@ def main():
         )
 
     # Run the MCP server
-    app.run()
+    if transport != "stdio":
+        print(
+            f"Serving MCP over {transport} on "
+            f"{http_settings['host']}:{http_settings['port']}"
+            f"{http_settings['streamable_http_path']}",
+            file=sys.stderr,
+        )
+    app.run(transport)
 
 
 if __name__ == "__main__":

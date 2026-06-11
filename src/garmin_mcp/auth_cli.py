@@ -259,6 +259,44 @@ def verify_tokens(token_path: str) -> bool:
         return False
 
 
+def export_tokens(token_path: str) -> bool:
+    """Print saved tokens as a single string for headless deployments.
+
+    The output can be set as the GARMINTOKENS environment variable on a
+    remote host (e.g. Railway) so the server can log in without a token
+    directory or interactive MFA.
+
+    Args:
+        token_path: Path to token directory
+
+    Returns:
+        bool: True if tokens were exported, False otherwise
+    """
+    expanded_path = os.path.expanduser(token_path)
+
+    if not token_exists(token_path):
+        print(f"✗ Tokens not found at: {expanded_path}", file=sys.stderr)
+        print("\nRun 'garmin-mcp-auth' to authenticate first.", file=sys.stderr)
+        return False
+
+    try:
+        garmin = Garmin()
+        garmin.client.load(expanded_path)
+        token_data = garmin.client.dumps()
+    except Exception as e:
+        print(f"✗ Could not read tokens: {e}", file=sys.stderr)
+        return False
+
+    print(
+        "\nSet the line below as the GARMINTOKENS environment variable on your\n"
+        "server (e.g. Railway). Treat it like a password — it grants full\n"
+        "access to your Garmin account:\n",
+        file=sys.stderr,
+    )
+    print(token_data)
+    return True
+
+
 def main():
     """Main entry point for the authentication CLI tool."""
     parser = argparse.ArgumentParser(
@@ -274,6 +312,9 @@ Examples:
 
   # Verify existing tokens
   garmin-mcp-auth --verify
+
+  # Export tokens for a headless deployment (Railway etc.)
+  garmin-mcp-auth --export
 
   # Force re-authentication
   garmin-mcp-auth --force-reauth
@@ -294,6 +335,12 @@ Examples:
         "--verify",
         action="store_true",
         help="Verify existing tokens without re-authenticating"
+    )
+
+    parser.add_argument(
+        "--export",
+        action="store_true",
+        help="Print saved tokens as a single string for use as GARMINTOKENS on a remote host"
     )
 
     parser.add_argument(
@@ -320,6 +367,11 @@ Examples:
         is_cn = True
     else:
         is_cn = os.getenv("GARMIN_IS_CN", "false").lower() in ("true", "1", "yes")
+
+    # Export mode: keep stdout clean so the token can be piped/copied directly
+    if args.export:
+        success = export_tokens(token_path)
+        sys.exit(0 if success else 1)
 
     print("\n" + "=" * 60)
     print("Garmin MCP Pre-Authentication Tool")
