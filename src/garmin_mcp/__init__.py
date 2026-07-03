@@ -87,6 +87,81 @@ tokenstore_base64 = os.getenv("GARMINTOKENS_BASE64") or "~/.garminconnect_base64
 is_cn = os.getenv("GARMIN_IS_CN", "false").lower() in ("true", "1", "yes")
 
 
+def _seed_tokenstore(tokenstore_path, seed):
+    """Seed a persistent tokenstore directory from exported token data.
+
+    Garmin's DI refresh tokens rotate on every refresh: each refresh returns a
+    new refresh token and invalidates the previous one. The library only
+    persists the rotated token when tokens were loaded from a *path* (which
+    sets the client's tokenstore path); inline GARMINTOKENS *data* cannot be
+    written back, so on the next container restart the stale seed token is
+    already dead -> 401.
+
+    For remote deployments (see RAILWAY.md) mount a persistent volume, point
+    GARMINTOKENS at a path on it, and provide the exported token JSON via
+    GARMINTOKENS_SEED. This seeds the volume; thereafter the volume holds the
+    continuously-rotated token and survives restarts.
+
+    A fingerprint of the seed is stored alongside the token file so that a
+    normal restart (seed unchanged) never clobbers the rotated token, while
+    changing GARMINTOKENS_SEED and redeploying forces a fresh token — the
+    entire ~6-month refresh procedure.
+
+    Returns True if a seed file was written, False otherwise.
+    """
+    import hashlib
+
+    if not seed:
+        return False
+    # Only seed a path-style tokenstore, never inline token data.
+    if len(tokenstore_path) > 512:
+        print(
+            "WARNING: GARMINTOKENS_SEED is set but GARMINTOKENS holds inline token "
+            "data, so the seed is ignored and rotated tokens will NOT persist "
+            "across restarts. Set GARMINTOKENS to a directory path on a "
+            "persistent volume (see RAILWAY.md).",
+            file=sys.stderr,
+        )
+        return False
+
+    token_dir = os.path.expanduser(tokenstore_path)
+    token_file = os.path.join(token_dir, "garmin_tokens.json")
+    fingerprint_file = os.path.join(token_dir, ".seed_fingerprint")
+    seed_fingerprint = hashlib.sha256(seed.encode()).hexdigest()
+
+    if os.path.exists(token_file):
+        existing = None
+        if os.path.exists(fingerprint_file):
+            with open(fingerprint_file) as f:
+                existing = f.read().strip()
+        if existing == seed_fingerprint:
+            return False  # unchanged seed: preserve the rotated token
+        if existing is None:
+            # Token predates fingerprinting; adopt the current seed as the
+            # baseline without clobbering a possibly-rotated token.
+            print(
+                "Existing token store found; GARMINTOKENS_SEED was NOT applied "
+                "(adopted as baseline). To force a re-seed, change the "
+                "GARMINTOKENS_SEED value and redeploy.",
+                file=sys.stderr,
+            )
+            with open(fingerprint_file, "w") as f:
+                f.write(seed_fingerprint)
+            return False
+        # Seed value changed: an intentional re-seed. Replace the token.
+
+    os.makedirs(token_dir, exist_ok=True)
+    with open(token_file, "w") as f:
+        f.write(seed)
+    with open(fingerprint_file, "w") as f:
+        f.write(seed_fingerprint)
+    try:
+        os.chmod(token_dir, 0o700)
+    except OSError:
+        pass
+    return True
+
+
 # --- Tool filtering ---------------------------------------------------------
 # Optionally expose only a subset of tools, to reduce the context an LLM must
 # carry. No modules are removed; tools are simply not registered when filtered.
@@ -153,6 +228,14 @@ class _ToolFilter:
 def init_api(email, password):
     """Initialize Garmin API with your credentials."""
     import io
+
+    # Seed a persistent tokenstore from GARMINTOKENS_SEED on first boot so that
+    # rotated refresh tokens can be written back and survive restarts.
+    if _seed_tokenstore(tokenstore, os.getenv("GARMINTOKENS_SEED")):
+        print(
+            f"Seeded token store at '{tokenstore}' from GARMINTOKENS_SEED.",
+            file=sys.stderr,
+        )
 
     # GARMINTOKENS may hold a directory path or, for headless deployments
     # (e.g. Railway), the raw token data printed by `garmin-mcp-auth --export`.
@@ -337,6 +420,48 @@ def _http_settings_from_env(environ=None):
 # ------------------------------------------------------------------------------
 
 
+# --- Health endpoint ----------------------------------------------------------
+# Garmin tokens expire after ~6 months and can only be renewed interactively
+# (MFA). The health endpoint lets an uptime monitor detect expiry: it performs
+# a real (cheap) Garmin API call and returns 200/503, caching the result so
+# frequent pings don't hammer Garmin. It never returns account data.
+HEALTH_CACHE_SECONDS = 900
+
+
+def _make_health_endpoint(garmin_client, cache_seconds=HEALTH_CACHE_SECONDS, clock=None):
+    import time as _time
+
+    from starlette.responses import JSONResponse
+
+    clock = clock or _time.monotonic
+    cache = {"checked_at": None, "ok": False, "reason": None}
+
+    async def health(request):
+        import anyio
+
+        now = clock()
+        if cache["checked_at"] is None or now - cache["checked_at"] >= cache_seconds:
+            try:
+                await anyio.to_thread.run_sync(garmin_client.get_userprofile_settings)
+                cache.update(checked_at=now, ok=True, reason=None)
+            except Exception as err:
+                cache.update(checked_at=now, ok=False, reason=type(err).__name__)
+        if cache["ok"]:
+            return JSONResponse({"status": "ok"})
+        return JSONResponse(
+            {
+                "status": "error",
+                "reason": cache["reason"],
+                "hint": "Garmin call failed; if this persists, refresh tokens "
+                "with scripts/refresh-tokens.sh",
+            },
+            status_code=503,
+        )
+
+    return health
+# ------------------------------------------------------------------------------
+
+
 def main():
     """Initialize the MCP server and register all tools"""
 
@@ -404,6 +529,16 @@ def main():
             f"Tool filter: warning — name(s) not found and ignored: {', '.join(unknown)}",
             file=sys.stderr,
         )
+
+    # Optional uptime-monitor endpoint, HTTP transports only
+    health_path = os.getenv("MCP_HEALTH_PATH", "").strip()
+    if transport != "stdio" and health_path:
+        if not health_path.startswith("/"):
+            health_path = "/" + health_path
+        app.custom_route(health_path, methods=["GET"])(
+            _make_health_endpoint(garmin_client)
+        )
+        print(f"Health endpoint enabled at {health_path}", file=sys.stderr)
 
     # Run the MCP server
     if transport != "stdio":
