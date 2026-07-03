@@ -262,9 +262,9 @@ def verify_tokens(token_path: str) -> bool:
 def export_tokens(token_path: str) -> bool:
     """Print saved tokens as a single string for headless deployments.
 
-    The output can be set as the GARMINTOKENS environment variable on a
-    remote host (e.g. Railway) so the server can log in without a token
-    directory or interactive MFA.
+    The output is used as the GARMINTOKENS_SEED environment variable on a
+    remote host (e.g. Railway) to seed a persistent-volume token store, so
+    the server can log in without interactive MFA (see RAILWAY.md).
 
     Args:
         token_path: Path to token directory
@@ -288,9 +288,11 @@ def export_tokens(token_path: str) -> bool:
         return False
 
     print(
-        "\nSet the line below as the GARMINTOKENS environment variable on your\n"
-        "server (e.g. Railway). Treat it like a password — it grants full\n"
-        "access to your Garmin account:\n",
+        "\nSet the line below as the GARMINTOKENS_SEED environment variable on\n"
+        "your server, with GARMINTOKENS pointing at a directory on a persistent\n"
+        "volume (see RAILWAY.md — without the volume, rotated tokens are lost on\n"
+        "restart and logins die within ~a day). Treat it like a password — it\n"
+        "grants full access to your Garmin account:\n",
         file=sys.stderr,
     )
     print(token_data)
@@ -340,7 +342,7 @@ Examples:
     parser.add_argument(
         "--export",
         action="store_true",
-        help="Print saved tokens as a single string for use as GARMINTOKENS on a remote host"
+        help="Print saved tokens as a single string for use as GARMINTOKENS_SEED on a remote host (see RAILWAY.md)"
     )
 
     parser.add_argument(

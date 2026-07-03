@@ -357,7 +357,8 @@ For Codex and other clients, see the examples below.
 The server can also run as a **remote MCP server** over streamable HTTP, so
 claude.ai web and mobile can connect to it directly as a custom connector —
 no desktop app required. Set `MCP_TRANSPORT=streamable-http`, provide tokens
-via `GARMINTOKENS` (exported with `garmin-mcp-auth --export`), and serve at a
+via `GARMINTOKENS_SEED` (exported with `garmin-mcp-auth --export`) backed by a
+persistent volume, and serve at a
 secret path with `MCP_HTTP_PATH`. See [RAILWAY.md](RAILWAY.md) for the full
 runbook.
 
